@@ -67,7 +67,9 @@ Undo everything with `tools/restore.sh <the same list>`.
   `launcher/assets/wallpapers/` (1920×1080 JPEGs, credits in `launcher/WALLPAPER-CREDITS.md`).
 - Deterministic D-pad focus, remembers the last tile, picks up newly installed apps on return.
 
-Change the dock: edit `config.xml`, then run `launcher/build-and-install.sh`.
+Change which apps are in the dock: edit `config.xml`, then run `launcher/build-and-install.sh`.
+Reorder them from the remote: hold OK on a dock app, move it with Left/Right, press OK (or Back) to
+drop it. The order is saved on the TV and survives reinstalls of the launcher.
 
 ## Gotchas we hit
 

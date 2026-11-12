@@ -34,6 +34,7 @@ import android.view.KeyEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.ViewOutlineProvider;
+import android.view.ViewTreeObserver;
 import android.view.animation.DecelerateInterpolator;
 import android.view.animation.OvershootInterpolator;
 import android.widget.FrameLayout;
@@ -100,6 +101,9 @@ public class MainActivity extends Activity {
     private boolean firstShow = true;
     private int packageSeq;
     private PopupWindow inputsPopup;
+    // Move mode: the dock card being moved (null when not moving), and whether OK went down during it.
+    private View moving;
+    private boolean moveOkDown;
 
     private final BroadcastReceiver tick = new BroadcastReceiver() {
         @Override public void onReceive(Context c, Intent i) { updateClock(); updateWifi(); }
@@ -159,6 +163,7 @@ public class MainActivity extends Activity {
         super.onPause();
         handler.removeCallbacks(rotateWallpaper);
         unregisterReceiver(tick);
+        endMove();
         if (inputsPopup != null) inputsPopup.dismiss();
     }
 
@@ -173,6 +178,7 @@ public class MainActivity extends Activity {
         super.onNewIntent(intent);
         // Home pressed while already home: jump back to the first dock app.
         if (inputsPopup != null) inputsPopup.dismiss();
+        endMove();
         if (!dockCards.isEmpty()) dockCards.get(0).requestFocus();
         scroll.smoothScrollTo(0, 0);
     }
@@ -360,8 +366,9 @@ public class MainActivity extends Activity {
             byPkg.put(a.pkg, a);
         }
 
+        moving = null; // the views are rebuilt below
         List<App> dock = new ArrayList<>();
-        for (String p : dockApps) if (byPkg.containsKey(p)) dock.add(byPkg.remove(p));
+        for (String p : dockOrder()) if (byPkg.containsKey(p)) dock.add(byPkg.remove(p));
         List<App> rest = new ArrayList<>(byPkg.values());
         Collections.sort(rest, (x, y) -> x.label.compareToIgnoreCase(y.label));
 
@@ -484,8 +491,116 @@ public class MainActivity extends Activity {
             }
         });
 
+        if (inDock) card.setOnLongClickListener(v -> { startMove(v); return true; });
         (inDock ? dockCards : gridCards).add(card);
         return box;
+    }
+
+    // ---------------------------------------------------------------- move mode
+
+    /**
+     * Dock order: the order saved from move mode, limited to apps still in config.xml, then any
+     * config.xml apps not placed yet, in config order.
+     */
+    private List<String> dockOrder() {
+        List<String> config = Arrays.asList(dockApps);
+        List<String> order = new ArrayList<>();
+        String saved = getPreferences(MODE_PRIVATE).getString("dock_order", "");
+        for (String p : saved.split(",")) if (config.contains(p) && !order.contains(p)) order.add(p);
+        for (String p : config) if (!order.contains(p)) order.add(p);
+        return order;
+    }
+
+    private void saveDockOrder() {
+        // Keep config apps that aren't installed in their place relative to the rest.
+        List<String> order = dockOrder();
+        List<String> shown = new ArrayList<>();
+        for (View c : dockCards) shown.add(((App) c.getTag()).pkg);
+        int k = 0;
+        for (int i = 0; i < order.size(); i++) if (shown.contains(order.get(i))) order.set(i, shown.get(k++));
+        getPreferences(MODE_PRIVATE).edit().putString("dock_order", String.join(",", order)).apply();
+    }
+
+    /** Long-press OK on a dock app: lift it; Left/Right move it, OK or Back puts it down. */
+    private void startMove(View card) {
+        if (moving != null) return;
+        moving = card;
+        moveOkDown = false;
+        card.animate().scaleX(1.2f).scaleY(1.2f).translationY(-dp(8))
+                .setInterpolator(new OvershootInterpolator(2f)).setDuration(240).start();
+        title.setText("◀  ▶  to move  ·  OK when done");
+        title.animate().alpha(1f).setDuration(200).start();
+    }
+
+    private void endMove() {
+        View card = moving;
+        if (card == null) return;
+        moving = null;
+        float s = card.hasFocus() || card.isFocused() ? 1.12f : 1f;
+        card.animate().scaleX(s).scaleY(s).translationY(0)
+                .setInterpolator(new DecelerateInterpolator()).setDuration(200).start();
+        title.setText(((App) card.getTag()).label);
+    }
+
+    private void shiftDock(int dir) {
+        int i = dockCards.indexOf(moving), j = i + dir;
+        if (i < 0 || j < 0 || j >= dockCards.size()) return;
+        View box = dockRow.getChildAt(i), other = dockRow.getChildAt(j);
+        float boxX = box.getX(), otherX = other.getX();
+        // Move the neighbour rather than the focused tile, so focus never leaves it.
+        dockRow.removeView(other);
+        dockRow.addView(other, i);
+        int n = dockRow.getChildCount();
+        for (int c = 0; c < n; c++) {
+            LinearLayout.LayoutParams p = (LinearLayout.LayoutParams) dockRow.getChildAt(c).getLayoutParams();
+            p.setMargins(c == 0 ? 0 : dp(10), 0, c == n - 1 ? 0 : dp(10), 0);
+        }
+        dockRow.requestLayout();
+        Collections.swap(dockCards, i, j);
+        wireFocus();
+        saveDockOrder();
+        ViewTreeObserver vto = dockRow.getViewTreeObserver();
+        vto.addOnPreDrawListener(new ViewTreeObserver.OnPreDrawListener() {
+            @Override public boolean onPreDraw() {
+                dockRow.getViewTreeObserver().removeOnPreDrawListener(this);
+                slideFrom(box, boxX);
+                slideFrom(other, otherX);
+                return true;
+            }
+        });
+    }
+
+    private void slideFrom(View v, float oldX) {
+        v.animate().cancel();
+        v.setTranslationX(oldX - v.getLeft());
+        v.animate().translationX(0).setInterpolator(new DecelerateInterpolator(2f)).setDuration(220).start();
+    }
+
+    /** Keys while moving. Returns null to let the key through unchanged. */
+    private Boolean moveKey(KeyEvent e) {
+        boolean down = e.getAction() == KeyEvent.ACTION_DOWN;
+        switch (e.getKeyCode()) {
+            case KeyEvent.KEYCODE_DPAD_LEFT:
+            case KeyEvent.KEYCODE_DPAD_RIGHT:
+                if (down) shiftDock(e.getKeyCode() == KeyEvent.KEYCODE_DPAD_LEFT ? -1 : 1);
+                return true;
+            case KeyEvent.KEYCODE_DPAD_UP:
+            case KeyEvent.KEYCODE_DPAD_DOWN:
+            case KeyEvent.KEYCODE_MENU:
+                return true;
+            case KeyEvent.KEYCODE_DPAD_CENTER:
+            case KeyEvent.KEYCODE_ENTER:
+            case KeyEvent.KEYCODE_NUMPAD_ENTER:
+                // The long press that started the move ends with an OK release: let that one through.
+                if (down && e.getRepeatCount() == 0) { moveOkDown = true; return true; }
+                if (!down && moveOkDown) { endMove(); return true; }
+                return null;
+            case KeyEvent.KEYCODE_BACK:
+                if (!down) endMove();
+                return true;
+            default:
+                return null;
+        }
     }
 
     /** Explicit D-pad targets: one row per press, ends of rows and of the top bar don't wrap. */
@@ -825,6 +940,10 @@ public class MainActivity extends Activity {
 
     @Override
     public boolean dispatchKeyEvent(KeyEvent e) {
+        if (moving != null) {
+            Boolean handled = moveKey(e);
+            if (handled != null) return handled;
+        }
         // Menu key on the remote opens the Inputs dropdown.
         if (e.getKeyCode() == KeyEvent.KEYCODE_MENU && e.getAction() == KeyEvent.ACTION_UP && !pills.isEmpty()) {
             showInputs(pills.get(0));
